@@ -1,0 +1,653 @@
+---
+title: "Kattegat_Case_Study_Chronic_Trawling"
+output: html_document
+date: "2024-07-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(naniar)
+library(SRS)
+library(ggfortify)
+library(RColorBrewer)
+library(ade4)
+library(nlme)
+library(gplots)
+library(scales)
+library(adespatial)
+library(ggiraphExtra)
+library(ggpubr)
+
+```
+
+#Meiofauna
+#18S data
+```{r data input}
+meta <- read.csv("18S_meta_Kattegat.csv", header=T)%>%
+  dplyr::rename(ID=sampleID_for_now)
+meta$User.ID <- gsub(".1b", "", meta$User.ID)  
+meta$User.ID <- gsub(".2b", "", meta$User.ID) 
+
+counts <- read.table("silva132/ASV_table.tsv", stringsAsFactors = F, header =T)%>%
+          gather(sample,count, 2:ncol(.))%>%
+          filter(count > 0)%>%
+          dplyr::rename(ID = sample)
+
+taxa <- read.delim("silva132/ASV_tax.silva_132.tsv",stringsAsFactors = FALSE, header=TRUE)%>%
+ filter(Kingdom %in% "Eukaryota")%>%
+        replace_with_na_if(.predicate = is.character,
+                          condition = ~.x %in% (""))%>%
+        replace_na(list(Kingdom="zz_Unclassified"))%>%
+        replace_na(list(Phylum="zz_Unclassified"))%>%
+        replace_na(list(Class="zz_Unclassified"))%>%
+        replace_na(list(Order="zz_Unclassified"))%>%
+        replace_na(list(Family="zz_Unclassified"))%>%
+        replace_na(list(Genus="zz_Unclassified"))%>%
+        replace_na(list(Species="zz_Unclassified"))
+
+wide_relab_cat <- Tab_two %>%  
+  dplyr::select(ASV_ID,ID, relab) %>% 
+  spread(ASV_ID,relab, fill= 0) %>% 
+  remove_rownames() %>%
+  column_to_rownames(var = "ID")
+
+Tab_all_n <- counts%>% 
+  left_join(meta, by="ID") %>% 
+  left_join(taxa, by="ASV_ID")%>%
+  filter(Kingdom %in% "Eukaryota")
+
+Tab_all <- Tab_all_n %>%
+   filter(!Phylum %in% c( "Hemichordata", "Echinodermata", "Ctenophora","Cercozoa","Ciliophora","Retaria"))%>%
+  filter(Phylum %in% c("Annelida","Arthropoda","Brachiopoda","Bryozoa","Cnidaria","Gastrotricha", "Kinorhyncha", "Mollusca", "Nematoda", "Nemertea", "Opisthokonta_ph", "Platyhelminthes", "Porifera", "Priapulida","Rotifera", "Tunicata", "Xenacoelomorpha"  ))%>%
+  group_by(User.ID) %>% 
+  filter(sum(count) >= 1000) %>% 
+  mutate(relab = count/sum(count)) %>%
+  ungroup()
+
+```
+
+```{r rarefaction curve}
+#rarefy
+countsRAW <- Tab_all_n  %>% 
+  dplyr::select(ASV_ID, ID, count) %>% 
+  spread(ASV_ID,count, fill= 0) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "ID")
+
+(raremax <- min(rowSums(countsRAW))) #98265
+
+#Rarefaction curve plot
+out<- rarecurve(countsRAW, step = 20, sample = raremax, cex = 0.6, label = F)
+Nmax <- sapply(out, function(x) max(attr(x, "Subsample")))
+Smax <- sapply(out, max)
+ 
+ 
+col <- c("black", "black")
+set.seed(3)
+grp <- factor(sample(seq_along(col), nrow(countsRAW), replace = TRUE))
+cols <- col[grp] 
+ 
+ 
+ plot(c(1, max(Nmax)), c(1, max(Smax)), xlab = "Sample Size",
+     ylab = "Species", type = "n")
+abline(v = raremax)
+for (i in seq_along(out)) {
+    N <- attr(out[[i]], "Subsample")
+    lines(N, out[[i]], col = cols[i])
+}
+```
+
+```{r alpha diversity}
+#test along the SRS value instead of trawled-not trawled
+
+#SRS analysis
+example_input_data <- Tab_all %>%
+  filter(depth %in% "1")%>%
+  group_by(ASV_ID, ID)%>%
+ summarise(count=sum(count))%>%
+   ungroup()%>%
+  dplyr::select(ASV_ID, ID, count)%>%
+  spread(ID,count, fill= 0) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "ASV_ID")
+
+meta_sub <- meta %>% filter(depth %in% "1")
+
+#(e.g. species counts of the library with the lowest sequencing depth):
+Cmin <- min(colSums(example_input_data))
+Cmin
+
+SRS_output <- SRS(data = example_input_data, Cmin = Cmin)
+
+#Shannon Diversity Index
+SRSshannon<- SRS_output %>%
+  t()%>%
+  data.frame()%>% 
+  rownames_to_column(var="ID")%>% 
+  plyr::ddply(~ID, function(x) {vegan::diversity(x[-1], index="shannon")}) %>%
+  dplyr::rename(shannon= V1) %>% #Shannon 
+  left_join(meta_sub, by="ID")
+
+
+
+SRSshannon$SAR_group<- factor(SRSshannon$SAR_group,levels=c("0",
+                    ">0.4-4.6" ,
+                   ">4.6"))
+
+shan.lm <- lm(shannon ~ SAR_2014_10, SRSshannon)
+
+SRSshannon %>%
+  filter(!site %in% "CL6")%>%
+ ggplot(aes(x = SAR_2014_10, y = shannon, color=SAR_group, group=SAR_2014_10)) +
+   geom_point(size=7) +
+  guides(size=guide_legend(order=3),
+         shape= guide_legend(override.aes=list(size=5),
+        colour=guide_legend(override.aes=list(size=6))))+
+ labs(x = "SAR year-1", y = "Shannon´s H", size=8) +
+        scale_color_manual(values=c("green","orange","red"))+
+   theme_classic()+  theme(
+    legend.position = 'right',
+    axis.text.x=element_text(angle = 0, hjust = 0.5, size=12),
+    axis.text.y=element_text(angle = 0, hjust = 0, size=12), 
+    legend.text = element_text(size=12)
+  )+
+
+   guides(colour = guide_legend(override.aes = list(size=7), title="SAR", nrow=13))+
+   scale_x_continuous(breaks = scales::pretty_breaks(n = 8))+
+  geom_abline(slope = coef(shan.lm)[["SAR_2014_10"]], 
+              intercept = coef(shan.lm)[["(Intercept)"]],
+              linetype= "dashed", color="grey76")
+
+sppdiv_aov <- aov(shannon ~ SAR_type, data = SRSshannon)
+summary(sppdiv_aov)
+
+```
+
+
+#Forams
+##count data
+
+```{r data}
+forams <- read.csv("forams.csv", header=T)
+
+forams_meta <- forams %>% 
+  dplyr::select(ID, Site, OM_pct_10,porosity_10, DBD_10, chl_10, o2_min_cmems_10, o2_range_cmems_10,water_depth, TOC, LOI, SAR_2014,SAR_group,swm_d, sal_alt, curr_med, curr_range, lat, long, project, trawling)
+
+forams_count <- forams %>%
+   dplyr::select(-Site, -OM_pct_10,-porosity_10, -DBD_10, -chl_10, -o2_min_cmems_10, -o2_range_cmems_10, -water_depth, -TOC, -LOI, -SAR_2014,-SAR_group, -swm_d ,-sal_alt, -curr_med, -curr_range, -lat, -long, -project, -trawling, - OPD)%>%
+  gather(spec,count, 2:ncol(.))%>%
+          filter(count > 0)
+
+forams_relab <- forams_count %>%
+    group_by(ID) %>% 
+    mutate(relab = count/sum(count)) %>%
+    ungroup()
+
+forams_dom <- forams_relab %>%
+  filter(spec %in% c("Adercotryma.glomerata","Ammonia.falsobeccari", "Ammoscalaria.pseudospiralis","Bulimina.marginata","Cassidulina.laevigata","Eggeroloides.scaber","Elphidium.excavatum","Epistominella.vitrea","Hyalinea.balthica","Nonionella.labradorica","Nonionella.sp...juvenile.not.identified.","Nonionella.sp..T1","Nonionella.turgida","Stainforthia.fusiformis","Textularia.earlandi"))
+
+forams.rare <- forams_relab %>% anti_join(forams_dom, by="spec")%>% mutate(spec="zz_Others_rare_<2%")
+
+forams_tot <- rbind(forams_dom, forams.rare)
+
+forams_combine_sum <- forams_tot %>% left_join(forams_meta, by="ID")
+
+forams_combine <- forams_relab%>% left_join(forams_meta, by="ID")
+
+```
+
+```{r alpha diversity}
+#alpha diversity
+example_input_data <- forams_combine %>%
+  dplyr::select(spec, ID, count)%>%
+  spread(ID,count, fill= 0) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "spec")
+
+#(e.g. species counts of the library with the lowest sequencing depth):
+Cmin <- min(colSums(example_input_data))
+Cmin
+
+SRS_output <- SRS(data = example_input_data, Cmin = as.integer(Cmin))
+
+SRSshannon<- SRS_output %>%
+  t()%>%
+  data.frame()%>% 
+  rownames_to_column(var="ID")%>% 
+  plyr::ddply(~ID, function(x) {vegan::diversity(x[-1], index="shannon")}) %>%
+  dplyr::rename(shannon= V1) %>% #Shannon 
+  left_join(forams_meta, by="ID")
+
+forams_alpha <- SRSshannon %>% dplyr::select(ID, shannon)
+
+shan.lm <- lm(shannon ~ SAR_2014, SRSshannon)
+
+SRSshannon$SAR_group<- factor(SRSshannon$SAR_group,levels=c("0",
+                    ">0.4-4.6" ,
+                   ">4.6"))
+
+  
+    SRSshannon %>%
+ ggplot(aes(x = SAR, y = shannon, color=SAR_group, group=as.character(SAR_2014))) +
+  geom_point(size=7) +
+ geom_point(size=5) +
+  guides(size=guide_legend(order=2),
+         shape= guide_legend(override.aes=list(size=2),
+        colour=guide_legend(override.aes=list(size=4))))+
+ labs(x = "SAR (year-1)", y = "Shannon´s H") +
+  scale_color_manual(values=c("green","orange","red"))+
+   theme_classic()+  theme(
+    legend.position = 'right',
+    axis.text.x=element_text(angle = -45, hjust = 0)
+  )+
+   geom_abline(slope = coef(shan.lm)[["SAR_2014"]], 
+              intercept = coef(shan.lm)[["(Intercept)"]],
+              linetype= "dashed", color="grey76")+
+   guides(colour = guide_legend(override.aes = list(size=6), title="SAR", nrow=13))+
+   scale_x_continuous(breaks = scales::pretty_breaks(n = 7))
+
+
+```
+
+
+#Microfauna
+##16S data
+
+```{r data}
+meta <- read.csv("/16S_Kattegat.csv", header=T)%>%
+  dplyr::rename(ID=sampleID_for_now) %>% filter(project %in% "kattegat")
+meta$User.ID <- gsub(".1b", "", meta$User.ID)  
+meta$User.ID <- gsub(".2b", "", meta$User.ID)  
+
+
+counts <- read.table("dada2/ASV_table.tsv", stringsAsFactors = F, header =T)%>%
+          gather(sample,count, 2:ncol(.))%>%
+          filter(count > 0)%>%
+          dplyr::rename(ID = sample)
+
+taxa <- read.delim("dada2/ASV_tax.sbdi-gtdb.tsv",stringsAsFactors = FALSE, header=TRUE)%>%
+  replace_with_na(list(Domain=""))%>%
+        replace_with_na(list(Kingdom=""))%>%
+        replace_with_na(list(Phylum=""))%>%
+        replace_with_na(list(Class=""))%>%
+        replace_with_na(list(Order=""))%>%
+        replace_with_na(list(Family=""))%>%
+        replace_with_na(list(Genus=""))%>%
+        replace_with_na(list(Species=""))%>%
+        replace_na(list(Domain="zz_Unclassified"))%>%
+        replace_na(list(Kingdom="zz_Unclassified"))%>%
+        replace_na(list(Phylum="zz_Unclassified"))%>%
+        replace_na(list(Class="zz_Unclassified"))%>%
+        replace_na(list(Order="zz_Unclassified"))%>%
+        replace_na(list(Family="zz_Unclassified"))%>%
+        replace_na(list(Genus="zz_Unclassified"))%>%
+        replace_na(list(Species="zz_Unclassified"))
+
+#combine tables
+Tab_all_n <- counts%>% 
+  left_join(meta, by="ID") %>% 
+  left_join(taxa, by="ASV_ID")%>%
+  dplyr::select( -NGI.ID, -X..Q30, -cutadapt_total_processed, -cutadapt_passing_filters, -cutadapt_passing_filters_percent, -DADA2_input, -filtered, -denoisedF, -denoisedR, -merged, -nonchim, -input_tax_filter, -filtered_tax_filter, -lost, -retained_percent, -lost_percent, -depth, -Kreads, -replicate )%>%
+  filter(project %in% "kattegat")
+
+#relab
+Tab_all <- Tab_all_n %>%
+  group_by(ID) %>% 
+  filter(sum(count) >= 1000) %>% 
+  mutate(relab = count/sum(count)) %>%
+  mutate(OM_pct = mean(OM_pct))%>%
+  mutate(porosity = mean(porosity))%>%
+  mutate(DBD = mean(DBD))%>%
+  mutate(chl =mean(chl))%>%
+  ungroup()%>%
+  rename(name = User.ID)
+
+#raw counts wide format
+countsRAW <- Tab_all %>%  
+  #group_by(User.ID) %>% 
+  #filter(sum(count) >= 1000) %>% 
+  #ungroup() %>%
+  dplyr::select(ASV_ID, ID, count) %>% 
+  spread(ASV_ID,count, fill= 0) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "ID")
+
+wide_relab_cat <- Tab_all %>%  
+  group_by(ASV_ID, User.ID)%>%
+ summarise(relab=mean(relab))%>%
+   ungroup()%>%
+  dplyr::select(ASV_ID, User.ID, relab) %>% 
+  spread(ASV_ID,relab, fill= 0) %>% 
+  remove_rownames() %>%
+  column_to_rownames(var = "User.ID")
+
+#wide_relab_cat2 <- Tab_all %>% 
+ # dplyr::select(ASV_ID, ID, relab) %>% 
+ # spread(ID,relab, fill= 0) %>% 
+  #remove_rownames() %>%
+ # column_to_rownames(var = "ASV_ID")
+```
+
+```{r rarefaction Supplemental}
+#rarefy
+countsRAW <- Tab_all_n  %>% 
+  dplyr::select(ASV_ID, ID, count) %>% 
+  spread(ASV_ID,count, fill= 0) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "ID")
+
+(raremax <- min(rowSums(countsRAW))) #98265
+
+#Rarefaction curve plot
+out<- rarecurve(countsRAW, step = 20, sample = raremax, cex = 0.6, label = F)
+Nmax <- sapply(out, function(x) max(attr(x, "Subsample")))
+Smax <- sapply(out, max)
+ 
+ 
+col <- c("black", "black")
+set.seed(3)
+grp <- factor(sample(seq_along(col), nrow(countsRAW), replace = TRUE))
+cols <- col[grp] 
+ 
+ 
+ plot(c(1, max(Nmax)), c(1, max(Smax)), xlab = "Sample Size",
+     ylab = "Species", type = "n")
+abline(v = raremax)
+for (i in seq_along(out)) {
+    N <- attr(out[[i]], "Subsample")
+    lines(N, out[[i]], col = cols[i])
+}
+```
+
+```{r alpha diversity}
+example_input_data <- Tab_all %>%
+  filter(depth %in% "1")%>%
+  group_by(ASV_ID, ID)%>%
+ summarise(count=sum(count))%>%
+   ungroup()%>%
+  dplyr::select(ASV_ID, ID, count)%>%
+  spread(ID,count, fill= 0) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "ASV_ID")
+
+#(e.g. species counts of the library with the lowest sequencing depth):
+Cmin <- min(colSums(example_input_data))
+Cmin
+
+SRS_output <- SRS(data = example_input_data, Cmin = Cmin)
+
+Tab_sub <- Tab_all %>%
+  filter(depth %in% "1")
+
+#Shannon Diversity Index
+SRSshannon<- SRS_output %>%
+  t()%>%
+  data.frame()%>% 
+  rownames_to_column(var="ID")%>% 
+   plyr::ddply(~ID, function(x) {vegan::diversity(x[-1], index="shannon")}) %>%
+  dplyr::rename(shannon= V1) %>% #Shannon 
+  left_join(Tab_sub, by="ID")
+
+
+shan.lm <- lm(shannon ~ SAR_2014_10, SRSshannon)
+
+SRSshannon$SAR_group<- factor(SRSshannon$SAR_group,levels=c("0",
+                    ">0.4-4.6" ,
+                   ">4.6"))
+
+
+  SRSshannon %>%
+ ggplot(aes(x = SAR, y = shannon, color=SAR_group, group=as.character(SAR_2014_10))) +
+  geom_point(size=7) +
+ geom_point(size=5) +
+  guides(size=guide_legend(order=2),
+         shape= guide_legend(override.aes=list(size=2),
+        colour=guide_legend(override.aes=list(size=4))))+
+ labs(x = "SAR (year-1)", y = "Shannon´s H") +
+  scale_color_manual(values=c("green","orange","red"))+
+   theme_classic()+  theme(
+    legend.position = 'right',
+    axis.text.x=element_text(angle = -45, hjust = 0)
+  )+
+   geom_abline(slope = coef(shan.lm)[["SAR_2014_10"]], 
+              intercept = coef(shan.lm)[["(Intercept)"]],
+              linetype= "dashed", color="grey76")+
+   guides(colour = guide_legend(override.aes = list(size=6), title="SAR", nrow=13))+
+   scale_x_continuous(breaks = scales::pretty_breaks(n = 7))
+
+```
+
+```{Figure S3}
+Tab_all$SAR_group<- factor(Tab_all$SAR_group,levels=c("0",
+                    ">0.4-4.6" ,
+                   ">4.6"))
+
+cyano <-Tab_all %>%
+  filter(Phylum %in% "Cyanobacteria")%>%
+  group_by(SAR_group, Phylum)%>%
+  summarise(relab=mean(relab))%>%
+  ungroup()%>%
+  ggplot(aes(SAR_group,relab, color=Phylum))+
+  geom_point(aes(size=5))+
+  theme_classic()+
+  theme(legend.position = "right")+
+    guides(colour = guide_legend(override.aes = list(size=6), title="Phylum", nrow=13))+
+ggtitle("Cyanobacteria")
+
+ 
+chl <-Tab_all %>%
+ # filter(Phylum %in% "Cyanobacteria")%>%
+  group_by(SAR_group)%>%
+  summarise(chl=mean(chl))%>%
+  ungroup() %>%
+  ggplot( aes(SAR_group,chl, color=SAR_group)) + 
+  geom_point(aes(size=5))+
+    theme_classic()+
+  theme(legend.position = "right")+
+    guides(colour = guide_legend(override.aes = list(size=6), title="SAR", nrow=13))+
+ggtitle("Chlorophyll")
+
+ggarrange(cyano, chl, ncol=2,  labels = c("A", "B"))
+```
+
+
+#Macrofauna
+#count data
+
+```{r data}
+#macrofauna
+
+meio <- read.csv("macrofauna.csv", header=T)%>%
+  dplyr::rename(site=station)
+
+
+#meiofauna
+
+meta_meio <- read.csv("meta_macro_Kattegat.csv", header=T)#%>%
+#  dplyr::rename(ID=sampleID_for_now)%>%
+ # dplyr::select(site, water_depth, trawling, lat, long, SAR_2014_10, SAR_group, SAR_type, swm_d_10, log_swm_d_plus_1_10, salt_range_cmems_10, curr_median_cmems_10, curr_range_cmems_10, OM_pct, porosity, DBD, DBD_group, chl, o2_min_cmems_10, o2_range_cmems_10, D_10, BQI_2009_10, totWW_10, IPc_WW_10, BPc_WW_10)%>%
+  #group_by(site)%>%
+   #   filter(row_number() ==1)%>%
+  #ungroup()
+meta_meio$PRT.CHO_5cm <- as.numeric(meta_meio$PRT.CHO_5cm)  
+
+
+#combine tables
+
+meta_macro <- meio %>% inner_join(meta_meio, by="site")
+```
+
+```{r alpha diversity}
+#alpha diversity
+example_input_data <- macro_all %>%
+  dplyr::select(taxa, site, abundance)%>%
+  spread(site,abundance, fill= 0) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "taxa")
+
+#(e.g. species counts of the library with the lowest sequencing depth):
+Cmin <- min(colSums(example_input_data))
+Cmin
+
+SRS_output <- SRS(data = example_input_data, Cmin = as.integer(Cmin))
+
+SRSshannon<- SRS_output %>%
+  t()%>%
+  data.frame()%>% 
+  rownames_to_column(var="site")%>% 
+  plyr::ddply(~site, function(x) {vegan::diversity(x[-1], index="shannon")}) %>%
+  dplyr::rename(shannon= V1) %>% #Shannon 
+  left_join(meta_macro, by="site")
+
+forams_alpha <- SRSshannon %>% dplyr::select(site, shannon)
+
+shan.lm <- lm(shannon ~ SAR, SRSshannon)
+
+
+
+SRSshannon$SAR_group<- factor(SRSshannon$SAR_group,levels=c("0",
+                    ">0.4-4.6" ,
+                   ">4.6"))
+
+  SRSshannon %>%
+ ggplot(aes(x = SAR, y = shannon, color=SAR_group, group=as.character(SAR))) +
+  geom_point(size=7) +
+ geom_point(size=5) +
+  guides(size=guide_legend(order=2),
+         shape= guide_legend(override.aes=list(size=2),
+        colour=guide_legend(override.aes=list(size=4))))+
+ labs(x = "SAR (year-1)", y = "Shannon´s H") +
+  scale_color_manual(values=c("green","orange","red"))+
+   theme_classic()+  theme(
+    legend.position = 'right',
+    axis.text.x=element_text(angle = -45, hjust = 0)
+  )+
+   geom_abline(slope = coef(shan.lm)[["SAR"]], 
+              intercept = coef(shan.lm)[["(Intercept)"]],
+              linetype= "dashed", color="grey76")+
+   guides(colour = guide_legend(override.aes = list(size=6), title="SAR", nrow=13))+
+   scale_x_continuous(breaks = scales::pretty_breaks(n = 7))
+```
+
+
+#Sediment chemistry
+##Environmental data
+
+```{r Env. Var.}
+
+meta<- read.csv("../../Sequencing_NGI/16S_amplison_seq/ampliseq_run/16S_meta_Bornholm2023_Kattegat.csv", header=T)%>%
+  dplyr::rename(ID=sampleID_for_now) %>% filter(project %in% "kattegat")
+meta$User.ID <- gsub(".1b", "", meta$User.ID)  
+meta$User.ID <- gsub(".2b", "", meta$User.ID)  
+
+
+meta_kat_sum <- meta%>%
+  filter(project %in% "kattegat")%>%
+  dplyr::select(User.ID, water_depth, OM_pct , porosity ,DBD , chl , BPc_WW_10 , IPc_WW_10 ,  totWW_10 ,BQI_2009_10 , D_10 , 
+                 SAR_2014_10 , swm_d_10 ,  log_swm_d_plus_1_10,salt_range_cmems_10, o2_range_cmems_10,curr_median_cmems_10,o2_min_cmems_10, PRT.CHO_ratio_0.2cm,curr_range_cmems_10, SAR_group) %>%
+  group_by(User.ID)%>%
+  mutate(OM_pct = mean(OM_pct))%>%
+  mutate(porosity =mean(porosity))%>%
+  mutate(DBD =mean(DBD))%>%
+  mutate(chl = mean(chl))%>%
+  filter(row_number() ==1)%>%
+  ungroup() 
+
+meta_kat_sum$SAR_group<- factor(meta_kat_sum$SAR_group,levels=c("0",
+                    ">0.4-4.6" ,
+                   ">4.6"))
+
+
+org <-meta_kat_sum %>%
+  ggplot(aes(x=SAR_2014_10, y=OM_pct, group=SAR_group, color=SAR_group))+
+     geom_point(size=7) +
+  guides(size=guide_legend(order=3),
+         shape= guide_legend(override.aes=list(size=5),
+        colour=guide_legend(override.aes=list(size=6))))+
+ labs(x = "SAR (year-1)", y = "Organic matter (%)", size=8) +
+      scale_color_manual(values=c("green","orange","red"))+
+ theme_classic()+  theme(
+    legend.position = 'right',
+    axis.text.x=element_text(angle = 0, hjust = 0.5, size=12),
+    axis.text.y=element_text(angle = 0, hjust = 0, size=12), 
+    legend.text = element_text(size=12)
+  )+
+ guides(colour = guide_legend(override.aes = list(size=7), title="SAR", nrow=13))+
+   scale_x_continuous(breaks = scales::pretty_breaks(n = 8))
+
+
+por <-meta_kat_sum %>%
+  ggplot(aes(x=SAR_2014_10, y=porosity, group=SAR_group, color=SAR_group))+
+    geom_point(size=7) +
+  guides(size=guide_legend(order=3),
+         shape= guide_legend(override.aes=list(size=5),
+        colour=guide_legend(override.aes=list(size=6))))+
+ labs(x = "SAR (year-1)", y = "Porosity (%)", size=8) +
+      scale_color_manual(values=c("green","orange","red"))+
+ theme_classic()+  theme(
+    legend.position = 'right',
+    axis.text.x=element_text(angle = 0, hjust = 0.5, size=12),
+    axis.text.y=element_text(angle = 0, hjust = 0, size=12), 
+    legend.text = element_text(size=12)
+  )+
+ guides(colour = guide_legend(override.aes = list(size=7), title="SAR", nrow=13))+
+   scale_x_continuous(breaks = scales::pretty_breaks(n = 8))
+
+
+chl <-meta_kat_sum %>%
+  ggplot(aes(x=SAR_2014_10, y=chl, group=SAR_group, color=SAR_group))+
+     geom_point(size=7) +
+  guides(size=guide_legend(order=3),
+         shape= guide_legend(override.aes=list(size=5),
+        colour=guide_legend(override.aes=list(size=6))))+
+ labs(x = "SAR (year-1)", y = "Chlorophyll (µg/cm³)", size=8) +
+      scale_color_manual(values=c("green","orange","red"))+
+ theme_classic()+  theme(
+    legend.position = 'right',
+    axis.text.x=element_text(angle = 0, hjust = 0.5, size=12),
+    axis.text.y=element_text(angle = 0, hjust = 0, size=12), 
+    legend.text = element_text(size=12)
+  )+
+ guides(colour = guide_legend(override.aes = list(size=7), title="SAR", nrow=13))+
+   scale_x_continuous(breaks = scales::pretty_breaks(n = 8))
+
+
+
+pro <-meta_kat_sum %>%
+  ggplot(aes(x=SAR_2014_10, y=PRT.CHO_ratio_0.2cm, group=SAR_group, color=SAR_group))+
+    geom_point(size=7) +
+  guides(size=guide_legend(order=3),
+         shape= guide_legend(override.aes=list(size=5),
+        colour=guide_legend(override.aes=list(size=6))))+
+ labs(x = "SAR (year-1)", y = "PRT/CHO", size=8) +
+      scale_color_manual(values=c("green","orange","red"))+
+ theme_classic()+  theme(
+    legend.position = 'right',
+    axis.text.x=element_text(angle = 0, hjust = 0.5, size=12),
+    axis.text.y=element_text(angle = 0, hjust = 0, size=12), 
+    legend.text = element_text(size=12)
+  )+
+ guides(colour = guide_legend(override.aes = list(size=7), title="SAR", nrow=13))+
+   scale_x_continuous(breaks = scales::pretty_breaks(n = 8))
+
+
+dev.size()
+
+ggarrange(org, por, chl, pro, ncol=2, nrow=2, labels=c("A","B","C","D"), common.legend = TRUE, legend = "right")
+
+
+ggsave(file="../../../Kattegat/manuscript/figures/pdf/chemi_figure_3colors.pdf", width=7, height=5.5, dpi=300)
+```
+
+```{r session info}
+
+# Display current R session information
+sessionInfo()
+# Time of the most recent analysis
+Sys.time()
+
+```
